@@ -95,10 +95,13 @@ function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function navBar(active) {
+function navBar(active, extra = '') {
   const link = (href, label, key) =>
     `<a href="${href}" class="nav-link${active === key ? ' nav-active' : ''}">${label}</a>`;
-  return `<nav class="topnav">${link('/admin','回報總覽','overview')}${link('/admin/settings','系統設定','settings')}</nav>`;
+  return `<nav class="topnav">
+    <div style="display:flex">${link('/admin','回報總覽','overview')}${link('/admin/settings','系統設定','settings')}</div>
+    ${extra ? `<div style="display:flex;gap:8px;align-items:center">${extra}</div>` : ''}
+  </nav>`;
 }
 
 const BASE_CSS = `
@@ -107,7 +110,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 h1{font-size:20px;font-weight:700;color:#f1f5f9;margin-bottom:4px}
 .subtitle{font-size:13px;color:#64748b;margin-bottom:16px}
 h2{font-size:15px;font-weight:600;color:#93c5fd;margin:24px 0 12px;border-left:3px solid #3b82f6;padding-left:10px}
-.topnav{display:flex;gap:0;border-bottom:1px solid #334155;margin-bottom:24px}
+.topnav{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155;margin-bottom:24px;padding-bottom:4px}
+.btn-nav{padding:7px 13px;border-radius:6px;font-size:12px;font-weight:600;text-decoration:none;display:inline-block;white-space:nowrap;border:none;cursor:pointer}
+.btn-green{background:#15803d;color:#dcfce7}
+.btn-green:hover{background:#166534}
+.btn-sky{background:#0369a1;color:#e0f2fe}
+.btn-sky:hover{background:#075985}
 .nav-link{padding:10px 20px;text-decoration:none;font-size:14px;font-weight:600;color:#64748b}
 .nav-active{color:#60a5fa;border-bottom:2px solid #3b82f6}
 .wrap{background:#1e293b;border:1px solid #334155;border-radius:10px;overflow:auto;margin-bottom:8px}
@@ -548,6 +556,179 @@ function buildDailyPDF(targetDate) {
   });
 }
 
+// ── 月報 PDF 產製 ─────────────────────────────────────────────
+function buildMonthlyPDF(targetMonth) {
+  return new Promise((resolve, reject) => {
+    const rows = db.prepare(
+      `SELECT * FROM reports WHERE reported_at LIKE ? ORDER BY reported_at ASC`
+    ).all(`${targetMonth}%`);
+
+    const activeSites  = db.prepare('SELECT name FROM sites WHERE active = 1 ORDER BY id').all().map(r => r.name);
+    const totalWorkers = rows.reduce((s, r) => s + (parseInt(r.worker_count) || 0), 0);
+    const totalDays    = new Set(rows.map(r => r.reported_at.slice(0, 10))).size;
+
+    // 各工地統計
+    const siteDays    = {};
+    const siteWorkers = {};
+    rows.forEach(r => {
+      if (!siteDays[r.site_name])    siteDays[r.site_name]    = new Set();
+      if (!siteWorkers[r.site_name]) siteWorkers[r.site_name] = 0;
+      siteDays[r.site_name].add(r.reported_at.slice(0, 10));
+      siteWorkers[r.site_name] += parseInt(r.worker_count) || 0;
+    });
+
+    // 依日期分組
+    const byDate = {};
+    rows.forEach(r => {
+      const d = r.reported_at.slice(0, 10);
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push(r);
+    });
+
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    const buffers = [];
+    doc.on('data', b => buffers.push(b));
+    doc.on('end', () => resolve(Buffer.concat(buffers)));
+    doc.on('error', reject);
+
+    doc.registerFont('CJK', FONT_PATH).font('CJK');
+
+    const ML = 40;
+    const PW = doc.page.width - ML * 2;
+    const [yr, mo] = targetMonth.split('-');
+
+    // ── 第一頁：月統計摘要 ─────────────────────────────────────
+    doc.fontSize(20).fillColor('#1d3461')
+       .text('Hans 工程回報月報表', ML, 44, { width: PW, align: 'center' });
+    doc.fontSize(13).fillColor('#334155')
+       .text(`${yr}年${mo}月`, ML, 72, { width: PW, align: 'center' });
+    doc.moveTo(ML, 95).lineTo(ML + PW, 95).strokeColor('#3b82f6').lineWidth(1.5).stroke();
+
+    let cy = 108;
+    doc.fontSize(11).fillColor('#1d3461').text('本月統計摘要', ML, cy); cy += 18;
+    doc.fontSize(9.5).fillColor('#333333');
+    [
+      `・本月總回報次數：${rows.length} 筆`,
+      `・本月總出工人數：${totalWorkers} 人`,
+      `・本月有效回報天數：${totalDays} 天`,
+    ].forEach(line => { doc.text(line, ML + 8, cy); cy += 16; });
+    cy += 12;
+
+    // 各工地統計表
+    doc.fontSize(11).fillColor('#1d3461').text('各工地統計', ML, cy); cy += 14;
+
+    const sCols = [
+      { header: '工地名稱',    width: Math.floor(PW * 0.45) },
+      { header: '回報天數',    width: Math.floor(PW * 0.27) },
+      { header: '累計出工人數', width: 0 },
+    ];
+    sCols[2].width = Math.round(PW - sCols[0].width - sCols[1].width);
+    const SH = 22;
+
+    function drawSRow(cells, y, isHeader) {
+      let x = ML;
+      sCols.forEach(col => { doc.rect(x, y, col.width, SH).fill(isHeader ? '#1d3461' : '#f8fafc'); x += col.width; });
+      doc.rect(ML, y, PW, SH).strokeColor('#94a3b8').lineWidth(0.5).stroke();
+      x = ML;
+      sCols.forEach(col => { doc.moveTo(x, y).lineTo(x, y + SH).strokeColor('#94a3b8').lineWidth(0.3).stroke(); x += col.width; });
+      x = ML;
+      cells.forEach((txt, i) => {
+        doc.fillColor(isHeader ? '#ffffff' : '#222222').fontSize(isHeader ? 9 : 8.5)
+           .text(String(txt), x + 4, y + 6, { width: sCols[i].width - 8, lineBreak: false, ellipsis: true });
+        x += sCols[i].width;
+      });
+    }
+
+    drawSRow(['工地名稱', '回報天數', '累計出工人數'], cy, true); cy += SH;
+
+    // 合併 activeSites + 有回報但不在 active 的工地
+    const allSiteNames = [...new Set([...activeSites, ...Object.keys(siteDays)])];
+    allSiteNames.forEach(name => {
+      const days = siteDays[name] ? siteDays[name].size : 0;
+      const wks  = siteWorkers[name] || 0;
+      drawSRow([name, `${days} 天`, `${wks} 人`], cy, false); cy += SH;
+    });
+
+    // 頁尾
+    const fy = doc.page.height - 28;
+    doc.moveTo(ML, fy - 6).lineTo(ML + PW, fy - 6).strokeColor('#e2e8f0').lineWidth(0.8).stroke();
+    doc.fillColor('#94a3b8').fontSize(7.5).text(`產製時間：${twNow()}`, ML, fy, { width: PW, align: 'right' });
+
+    // ── 第二頁起：依日期分組明細 ──────────────────────────────
+    const dCols = [
+      { header: '工地名稱', pct: 0.15, wrap: false },
+      { header: '施工內容', pct: 0.35, wrap: true  },
+      { header: '出工人數', pct: 0.10, wrap: false },
+      { header: '施作數量', pct: 0.20, wrap: false },
+      { header: '照片數',   pct: 0.08, wrap: false },
+      { header: '回報時間', pct: 0.12, wrap: false },
+    ];
+    const dcols = dCols.map(c => ({ ...c, width: Math.floor(PW * c.pct) }));
+    const dUsed = dcols.reduce((s, c) => s + c.width, 0);
+    dcols[dcols.length - 1].width += Math.round(PW - dUsed);
+
+    const PAD_X = 4, PAD_Y = 5, MIN_RH = 18, HDR_H = 20;
+    const WDAYS = ['日', '一', '二', '三', '四', '五', '六'];
+
+    function calcDRowH(cells) {
+      doc.font('CJK').fontSize(8); let h = MIN_RH;
+      dcols.forEach((col, i) => {
+        if (!col.wrap) return;
+        const n = doc.heightOfString(String(cells[i] ?? '—'), { width: col.width - PAD_X * 2 }) + PAD_Y * 2;
+        if (n > h) h = n;
+      });
+      return Math.ceil(h);
+    }
+
+    function drawDRow(cells, y, rowH, isHeader) {
+      let x = ML;
+      dcols.forEach(col => { doc.rect(x, y, col.width, rowH).fill(isHeader ? '#1d3461' : '#f8fafc'); x += col.width; });
+      doc.rect(ML, y, PW, rowH).strokeColor('#94a3b8').lineWidth(0.5).stroke();
+      x = ML;
+      dcols.forEach(col => { doc.moveTo(x, y).lineTo(x, y + rowH).strokeColor('#94a3b8').lineWidth(0.3).stroke(); x += col.width; });
+      x = ML;
+      dcols.forEach((col, i) => {
+        const opts = isHeader || !col.wrap
+          ? { width: col.width - PAD_X * 2, lineBreak: false, ellipsis: true }
+          : { width: col.width - PAD_X * 2, lineBreak: true };
+        doc.fillColor(isHeader ? '#ffffff' : '#222222').fontSize(isHeader ? 8.5 : 8)
+           .text(String(cells[i] ?? '—'), x + PAD_X, y + PAD_Y, opts);
+        x += col.width;
+      });
+    }
+
+    if (!Object.keys(byDate).length) {
+      doc.addPage();
+      doc.fontSize(10).fillColor('#666666').text('本月尚無回報紀錄', ML, 60, { width: PW, align: 'center' });
+    } else {
+      doc.addPage(); cy = 40;
+
+      for (const [date, dateRows] of Object.entries(byDate)) {
+        const [, , dd] = date.split('-');
+        const wday = WDAYS[new Date(`${date}T12:00:00+08:00`).getDay()];
+
+        if (cy + 20 + HDR_H + MIN_RH > doc.page.height - 40) { doc.addPage(); cy = 40; }
+
+        doc.fontSize(11).fillColor('#1d3461').text(`${mo}月${dd}日（星期${wday}）`, ML, cy); cy += 16;
+        drawDRow(dcols.map(c => c.header), cy, HDR_H, true); cy += HDR_H;
+
+        dateRows.forEach(r => {
+          const imgCount = JSON.parse(r.image_paths || '[]').length;
+          const cells = [r.site_name, r.progress_text,
+            r.worker_count ? `${r.worker_count} 人` : '—',
+            r.work_quantity, String(imgCount || 0), (r.reported_at || '').slice(11, 16)];
+          const rh = calcDRowH(cells);
+          if (cy + rh > doc.page.height - 40) { doc.addPage(); cy = 40; drawDRow(dcols.map(c => c.header), cy, HDR_H, true); cy += HDR_H; }
+          drawDRow(cells, cy, rh, false); cy += rh;
+        });
+        cy += 14;
+      }
+    }
+
+    doc.end();
+  });
+}
+
 // ── Email 寄送 ────────────────────────────────────────────────
 async function sendDailyReport(targetDate) {
   targetDate = targetDate || twToday();
@@ -630,6 +811,26 @@ app.get('/report/today', async (req, res) => {
   }
 });
 
+// ── GET /report/monthly ───────────────────────────────────────
+app.get('/report/monthly', async (req, res) => {
+  const targetMonth = req.query.month || twToday().slice(0, 7);
+  if (!/^\d{4}-\d{2}$/.test(targetMonth))
+    return res.status(400).json({ error: 'Invalid month format, use YYYY-MM' });
+  try {
+    const pdfBuffer = await buildMonthlyPDF(targetMonth);
+    const [yr, mo] = targetMonth.split('-');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="monthly-report-${targetMonth}.pdf"`,
+      'Content-Length': pdfBuffer.length,
+    });
+    res.end(pdfBuffer);
+  } catch (err) {
+    console.error('[report/monthly]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET /admin ────────────────────────────────────────────────
 app.get('/admin', (_req, res) => {
   const allRows     = db.prepare('SELECT * FROM reports ORDER BY reported_at DESC').all();
@@ -675,7 +876,10 @@ app.get('/admin', (_req, res) => {
 </head>
 <body>
 <h1>Hans 工程回報後台</h1>
-${navBar('overview')}
+${navBar('overview', `
+  <a href="/report/today" class="btn-nav btn-green">⬇ 下載今日報表</a>
+  <a href="/report/monthly" class="btn-nav btn-sky">⬇ 下載本月報表</a>
+`)}
 <p class="subtitle">今日：${todayStr}　每 60 秒自動更新</p>
 
 <div class="cards">
