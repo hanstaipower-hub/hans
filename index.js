@@ -116,6 +116,10 @@ h2{font-size:15px;font-weight:600;color:#93c5fd;margin:24px 0 12px;border-left:3
 .btn-green:hover{background:#166534}
 .btn-sky{background:#0369a1;color:#e0f2fe}
 .btn-sky:hover{background:#075985}
+.btn-orange{background:#c2410c;color:#ffedd5}
+.btn-orange:hover{background:#9a3412}
+.alert-ok{background:#14532d;color:#86efac;padding:10px 16px;border-radius:8px;font-size:13px;margin-bottom:16px}
+.alert-err{background:#7f1d1d;color:#fca5a5;padding:10px 16px;border-radius:8px;font-size:13px;margin-bottom:16px}
 .nav-link{padding:10px 20px;text-decoration:none;font-size:14px;font-weight:600;color:#64748b}
 .nav-active{color:#60a5fa;border-bottom:2px solid #3b82f6}
 .wrap{background:#1e293b;border:1px solid #334155;border-radius:10px;overflow:auto;margin-bottom:8px}
@@ -831,6 +835,17 @@ app.get('/report/monthly', async (req, res) => {
   }
 });
 
+// ── POST /report/send（手動寄送今日報表）────────────────────────
+app.post('/report/send', async (req, res) => {
+  try {
+    await sendDailyReport();
+    res.redirect('/admin?sent=1');
+  } catch (err) {
+    console.error('[report/send]', err.message);
+    res.redirect('/admin?sent=0');
+  }
+});
+
 // ── GET /admin ────────────────────────────────────────────────
 app.get('/admin', (_req, res) => {
   const allRows     = db.prepare('SELECT * FROM reports ORDER BY reported_at DESC').all();
@@ -879,7 +894,12 @@ app.get('/admin', (_req, res) => {
 ${navBar('overview', `
   <a href="/report/today" class="btn-nav btn-green">⬇ 下載今日報表</a>
   <a href="/report/monthly" class="btn-nav btn-sky">⬇ 下載本月報表</a>
+  <form method="POST" action="/report/send" style="display:inline" onsubmit="return confirm('確定立即寄送今日報表給所有收件人？')">
+    <button type="submit" class="btn-nav btn-orange">📧 手動寄送今日報表</button>
+  </form>
 `)}
+${_req.query.sent === '1' ? '<div class="alert-ok">✅ 今日報表已寄送成功</div>' : ''}
+${_req.query.sent === '0' ? '<div class="alert-err">❌ 寄送失敗，請查看 log</div>' : ''}
 <p class="subtitle">今日：${todayStr}　每 60 秒自動更新</p>
 
 <div class="cards">
