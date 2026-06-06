@@ -17,7 +17,8 @@ const config = {
 const client = new line.Client(config);
 const app = express();
 
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+if (!fs.existsSync('uploads'))   fs.mkdirSync('uploads');
+if (!fs.existsSync('documents')) fs.mkdirSync('documents');
 
 // ── 時間工具 ─────────────────────────────────────────────────
 function twNow() {
@@ -28,8 +29,11 @@ function twToday() {
 }
 
 // ── 常數 ─────────────────────────────────────────────────────
-const PALETTE   = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9FF3', '#54A0FF'];
-const FONT_PATH = '/Library/Fonts/Arial Unicode.ttf';
+const PALETTE      = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FECA57', '#FF9FF3', '#54A0FF'];
+const FONT_PATH    = '/Library/Fonts/Arial Unicode.ttf';
+const DOCS_DIR     = path.join(__dirname, 'documents');
+const ALLOWED_EXTS = new Set(['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.xlsx', '.docx', '.txt']);
+const EXT_ICON     = { '.pdf': '📄', '.jpg': '🖼️', '.jpeg': '🖼️', '.png': '🖼️', '.gif': '🖼️', '.xlsx': '📊', '.docx': '📝', '.txt': '📃' };
 
 // ── 資料庫初始化 ──────────────────────────────────────────────
 const db = new DatabaseSync('reports.db');
@@ -99,7 +103,7 @@ function navBar(active, extra = '') {
   const link = (href, label, key) =>
     `<a href="${href}" class="nav-link${active === key ? ' nav-active' : ''}">${label}</a>`;
   return `<nav class="topnav">
-    <div style="display:flex">${link('/admin','回報總覽','overview')}${link('/admin/settings','系統設定','settings')}</div>
+    <div style="display:flex">${link('/admin','回報總覽','overview')}${link('/admin/settings','系統設定','settings')}${link('/files','文件下載','files')}</div>
     ${extra ? `<div style="display:flex;gap:8px;align-items:center">${extra}</div>` : ''}
   </nav>`;
 }
@@ -282,6 +286,71 @@ function showTab(name, btn) {
 </html>`;
 }
 
+// ── 檔案大小格式化 ────────────────────────────────────────────
+function fmtSize(bytes) {
+  if (bytes < 1024)       return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// ── LINE Bot：文件列表 Flex ───────────────────────────────────
+function fileListFlex() {
+  const baseUrl = process.env.BASE_URL || '';
+  const files = fs.readdirSync(DOCS_DIR)
+    .filter(f => ALLOWED_EXTS.has(path.extname(f).toLowerCase()))
+    .map(f => {
+      const stat = fs.statSync(path.join(DOCS_DIR, f));
+      return { name: f, size: stat.size, mtime: stat.mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+
+  if (!files.length) {
+    return { type: 'text', text: '📂 目前文件資料夾內沒有檔案。\n（請洽管理員上傳文件）' };
+  }
+
+  const rows = files.map(f => {
+    const ext  = path.extname(f.name).toLowerCase();
+    const icon = EXT_ICON[ext] || '📎';
+    return {
+      type: 'box', layout: 'horizontal', paddingAll: '12px',
+      borderWidth: '1px', borderColor: '#334155', cornerRadius: '8px',
+      margin: 'md',
+      contents: [
+        {
+          type: 'box', layout: 'vertical', flex: 1,
+          contents: [
+            { type: 'text', text: `${icon} ${f.name}`, size: 'sm', color: '#e2e8f0', wrap: true },
+            { type: 'text', text: fmtSize(f.size), size: 'xs', color: '#64748b', margin: 'xs' },
+          ],
+        },
+        {
+          type: 'button', flex: 0,
+          action: { type: 'uri', label: '下載', uri: `${baseUrl}/files/${encodeURIComponent(f.name)}` },
+          style: 'primary', color: '#1d4ed8', height: 'sm',
+        },
+      ],
+    };
+  });
+
+  return {
+    type: 'flex', altText: `文件列表（共 ${files.length} 個）`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: '#1e293b', paddingAll: '16px',
+        contents: [{ type: 'text', text: '📂 文件下載', color: '#60a5fa', size: 'lg', weight: 'bold' }],
+      },
+      body: {
+        type: 'box', layout: 'vertical', backgroundColor: '#0f172a', paddingAll: '12px',
+        contents: rows.length <= 10 ? rows : [
+          ...rows.slice(0, 10),
+          { type: 'text', text: `...還有 ${rows.length - 10} 個檔案，請至管理後台查看`, size: 'xs', color: '#64748b', margin: 'md' },
+        ],
+      },
+    },
+  };
+}
+
 // ── LINE Bot：工地 Carousel ───────────────────────────────────
 function siteCarousel() {
   const todayTW = twToday();
@@ -374,6 +443,10 @@ async function handleEvent(event) {
 
   if (event.message.type !== 'text') return null;
   const text = event.message.text.trim();
+
+  if (['文件', '下載', '檔案', 'files', 'docs'].includes(text.toLowerCase())) {
+    return client.replyMessage(replyToken, fileListFlex());
+  }
 
   switch (state.step) {
     case 0:
@@ -795,6 +868,56 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 // ── GET /uploads ─────────────────────────────────────────────
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// ── GET /files/:filename ──────────────────────────────────────
+app.get('/files/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const ext      = path.extname(filename).toLowerCase();
+  if (!ALLOWED_EXTS.has(ext)) return res.status(403).send('不支援的檔案類型');
+  const filepath = path.join(DOCS_DIR, filename);
+  if (!filepath.startsWith(DOCS_DIR + path.sep) && filepath !== DOCS_DIR) {
+    return res.status(403).send('存取被拒');
+  }
+  if (!fs.existsSync(filepath)) return res.status(404).send('檔案不存在');
+  res.download(filepath, filename);
+});
+
+// ── GET /files（文件列表頁）──────────────────────────────────
+app.get('/files', (_req, res) => {
+  const files = fs.readdirSync(DOCS_DIR)
+    .filter(f => ALLOWED_EXTS.has(path.extname(f).toLowerCase()))
+    .map(f => {
+      const stat = fs.statSync(path.join(DOCS_DIR, f));
+      return { name: f, size: fmtSize(stat.size), mtime: stat.mtime.toISOString().slice(0, 16).replace('T', ' ') };
+    })
+    .sort((a, b) => b.mtime.localeCompare(a.mtime));
+
+  const rows = files.length
+    ? files.map(f => `<tr>
+        <td>${esc(f.name)}</td>
+        <td class="mono">${esc(f.size)}</td>
+        <td class="mono">${esc(f.mtime)}</td>
+        <td><a href="/files/${encodeURIComponent(f.name)}" class="view-link" download>⬇ 下載</a></td>
+      </tr>`).join('')
+    : `<tr><td colspan="4" class="empty">尚無檔案（請將 PDF/圖片放入 documents/ 資料夾）</td></tr>`;
+
+  res.send(`<!DOCTYPE html>
+<html lang="zh-TW">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文件下載</title><style>${BASE_CSS}</style></head>
+<body>
+<h1>Hans 工程回報後台</h1>
+${navBar('')}
+<h2>文件下載（共 ${files.length} 個）</h2>
+<p class="subtitle">放入 <code>documents/</code> 資料夾的 PDF、圖片、Excel、Word 檔案會自動出現在此列表</p>
+<div class="wrap">
+  <table>
+    <thead><tr><th>檔案名稱</th><th>大小</th><th>修改時間</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</div>
+</body></html>`);
+});
 
 // ── GET /report/today ─────────────────────────────────────────
 app.get('/report/today', async (req, res) => {
